@@ -4,26 +4,50 @@ Ein bewusst kleiner, lokaler Prototyp für die geplante Audio-Analyse-Workbench.
 Die Aufnahme kommt zunächst immer von außen, etwa vom Diktiergerät, Smartphone,
 Google Recorder oder einer Smartwatch. Die App enthält keinen Recorder.
 
-## Start
+## Installation
+
+### Automatisches Setup (empfohlen)
+
+```bash
+./setup.sh
+```
+
+Das Skript lädt automatisch:
+- Silero VAD Model
+- YAMNet Sound Classification
+- Whisper.cpp tiny Model
+- Whisper.cpp Binary (für ARM64 wird es kompiliert)
+
+**Hinweis:** Pyannote Diarization-Models erfordern manuellen Download von HuggingFace aufgrund der Lizenz.
+
+### Manuelle Installation
 
 Voraussetzungen:
 
 - Python 3.10 oder neuer
 - FFmpeg im `PATH`
-- optional NumPy für die reichhaltigere Waveform- und Spektrogramm-Berechnung
 
 ```bash
-python3 -m pip install -r requirements.txt
-python3 server.py
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+# Models in models/ ablegen (siehe setup.sh für URLs)
 ```
 
-Danach im Browser `http://127.0.0.1:8787` öffnen.
+## Start
 
-Für Zugriff aus dem Heimnetz:
+Mit allen Analyzern (empfohlen):
+
+```bash
+./start.sh --host 0.0.0.0
+```
+
+Oder manuell ohne ML-Modelle:
 
 ```bash
 python3 server.py --host 0.0.0.0
 ```
+
+Danach im Browser `http://127.0.0.1:8787` öffnen.
 
 Der Default ist absichtlich `127.0.0.1`. Bei `0.0.0.0` sollte der Port nur im
 vertrauenswürdigen Heimnetz erreichbar sein. Es gibt im Prototyp noch keine
