@@ -1,0 +1,12 @@
+# Data and runtime files
+data/workbench.sqlite3
+data/recordings/*
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Large binaries and models (download separately)
+models/
+whisper-cli

@@ -1,0 +1,2 @@
+# Optional. The server also starts without this package, with a simpler fallback.
+numpy>=1.24

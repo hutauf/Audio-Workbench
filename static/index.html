@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0b1015" />
+    <title>Audio Workbench</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-row">
+          <div class="brand-mark">AW</div>
+          <div>
+            <div class="brand-name">Audio Workbench</div>
+            <div class="brand-version">LOCAL PROTOTYPE / 0.2</div>
+          </div>
+        </div>
+
+        <div class="privacy-badge"><span class="status-dot"></span> Nur lokal gespeichert</div>
+
+        <label class="dropzone" id="dropzone" for="file-input">
+          <input id="file-input" type="file" accept="audio/*,.m4a,.mp3,.wav,.flac,.ogg,.opus,.aac,.webm" />
+          <span class="dropzone-icon">＋</span>
+          <span class="dropzone-title">Audio importieren</span>
+          <span class="dropzone-copy">Datei hier ablegen oder auswählen</span>
+          <span class="dropzone-hint">FFmpeg-kompatible Formate</span>
+        </label>
+
+        <div class="sidebar-section-head">
+          <span>Aufnahmen</span>
+          <button class="icon-button" id="refresh-button" title="Aktualisieren" aria-label="Aktualisieren">↻</button>
+        </div>
+        <div class="recording-list" id="recording-list"></div>
+
+        <div class="sidebar-footer">
+          <div class="footer-line"><span class="pulse-ring"></span> Analyzer-Queue aktiv</div>
+          <p>Das Original bleibt unverändert. Analysejobs laufen nacheinander auf diesem Rechner.</p>
+        </div>
+      </aside>
+
+      <main class="main-content" id="main-content"></main>
+    </div>
+    <div class="toast" id="toast" role="status"></div>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>
