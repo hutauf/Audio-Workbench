@@ -21,18 +21,36 @@
         <div class="privacy-badge"><span class="status-dot"></span> Nur lokal gespeichert</div>
 
         <label class="dropzone" id="dropzone" for="file-input">
-          <input id="file-input" type="file" accept="audio/*,.m4a,.mp3,.wav,.flac,.ogg,.opus,.aac,.webm" />
+          <input id="file-input" type="file" multiple accept="audio/*,.m4a,.mp3,.wav,.flac,.ogg,.opus,.aac,.webm" />
           <span class="dropzone-icon">＋</span>
           <span class="dropzone-title">Audio importieren</span>
-          <span class="dropzone-copy">Datei hier ablegen oder auswählen</span>
+          <span class="dropzone-copy">Dateien hier ablegen oder auswählen</span>
           <span class="dropzone-hint">FFmpeg-kompatible Formate</span>
         </label>
+        <div id="import-progress" role="status" aria-live="polite"></div>
+
+        <form id="library-filters" class="library-filters">
+          <label>Sammlung durchsuchen<input id="library-query" type="search" placeholder="Dateiname, Wort, Katze …" /></label>
+          <label>Suchen in<select id="library-source"><option value="">Allen Ergebnissen</option value="filename">Dateinamen</option><option value="transcript">Transkripten</option><option value="sound">Geräuschen / Tierstimmen</option><option value="tags">Tags</option></select></label>
+          <div class="filter-pair">
+            <label>Sortieren<select id="library-sort"><option value="newest">Zuletzt importiert</option><option value="oldest">Zuerst importiert</option><option value="name">Dateiname A–Z</option><option value="longest">Längste zuerst</option><option value="shortest">Kürzeste zuerst</option><option value="modified">Dateizeit, neueste</option></select></label>
+            <label>Status<select id="library-status"><option value="">Alle</option><option value="ready">Bereit</option><option value="queued">Wartend</option><option value="processing">Analysiert</option><option value="partial">Teilweise</option><option value="failed">Fehler</option></select></label>
+          </div>
+          <details><summary>Tags, Zeitraum & Konfidenz</summary>
+            <label>Tag<input id="library-tag" list="known-tags" placeholder="z. B. Garten" /></label><datalist id="known-tags"></datalist>
+            <div class="filter-pair"><label>Import ab (UTC)<input id="library-after" type="date" /></label><label>Import bis (UTC)<input id="library-before" type="date" /></label></div>
+            <label>Modell-Konfidenz mindestens<select id="library-confidence"><option value="0">Alle</option><option value="0.5">50 %</option><option value="0.8">80 %</option></select></label>
+            <p>Dateizeit = letzte Dateiänderung, kein verifiziertes Aufnahmedatum. Suche nach Wörtern und Klassen; einige deutsche Geräuschbegriffe werden ergänzt.</p>
+          </details>
+          <button type="reset" class="small-button">Filter zurücksetzen</button>
+        </form>
 
         <div class="sidebar-section-head">
           <span>Aufnahmen</span>
           <button class="icon-button" id="refresh-button" title="Aktualisieren" aria-label="Aktualisieren">↻</button>
         </div>
         <div class="recording-list" id="recording-list"></div>
+        <nav class="library-pages" aria-label="Seiten der Sammlung"><button id="page-prev" class="small-button">←</button><span id="page-info" aria-live="polite"></span><button id="page-next" class="small-button">→</button></nav>
 
         <div class="sidebar-footer">
           <div class="footer-line"><span class="pulse-ring"></span> Analyzer-Queue aktiv</div>

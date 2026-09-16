@@ -1,4 +1,6 @@
-const state = { recordings: [], selectedId: null, detail: null, pollTimer: null, resizeObserver: null };
+const state = { recordings: [], selectedId: null, detail: null, pollTimer: null, resizeObserver: null,
+  offset: 0, total: 0, limit: 50, listRequest: 0, detailRequest: 0, visualRequest: 0,
+  viewStart: 0, viewSeconds: 30, visual: null, signature: null, pendingSeek: null };
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -52,30 +54,47 @@ async function api(url, options = {}) {
 }
 
 async function refreshList() {
-  state.recordings = await api("/api/recordings");
-  if (state.selectedId && !state.recordings.some((item) => item.id === state.selectedId)) state.selectedId = null;
+  const request = ++state.listRequest;
+  const params = new URLSearchParams({offset: state.offset, limit: state.limit});
+  for (const key of ['q','source','sort','status','tag','after','before','confidence']) {
+    const element = $(key === 'q' ? '#library-query' : `#library-${key}`);
+    if (element?.value) params.set(key, element.value);
+  }
+  const page = await api(`/api/recordings?${params}`);
+  if (request !== state.listRequest) return;
+  state.recordings = page.items;
+  state.offset = page.offset;
+  state.total = page.total;
   renderList();
-  if (state.selectedId) await refreshDetail();
-  else renderEmpty();
+  if (!state.selectedId) renderEmpty();
+  window.clearTimeout(state.listTimer);
+  if (page.pending) state.listTimer = window.setTimeout(() => refreshList().catch(e => showToast(e.message)), 4000);
 }
 
 function renderList() {
   const list = $("#recording-list");
+  $('#page-info').textContent = `${state.total ? state.offset+1 : 0}–${Math.min(state.offset+state.limit, state.total)} / ${state.total}`;
+  $('#page-prev').disabled = state.offset === 0;
+  $('#page-next').disabled = state.offset+state.limit >= state.total;
   if (!state.recordings.length) {
-    list.innerHTML = `<div class="empty-list">Noch keine Aufnahmen.<br />Importiere eine Datei, um die erste Analyse zu starten.</div>`;
+    list.innerHTML = `<div class="empty-list">Keine passenden Aufnahmen. Filter ändern oder Dateien importieren.</div>`;
     return;
   }
   list.innerHTML = state.recordings.map((recording) => `
-    <button class="recording-item ${recording.id === state.selectedId ? "is-selected" : ""}" data-recording-id="${recording.id}">
+    <article class="library-entry"><button class="recording-item ${recording.id === state.selectedId ? "is-selected" : ""}" data-recording-id="${recording.id}">
       <span class="recording-icon">◒</span>
       <span>
         <span class="recording-name">${escapeHtml(recording.original_name)}</span>
         <span class="recording-meta"><span class="recording-status ${escapeHtml(recording.status)}"></span>${formatDuration(recording.duration)} · ${formatDate(recording.created_at)}</span>
       </span>
-    </button>`).join("");
+    </button>
+    ${recording.tags.length ? `<div class="recording-tags">${recording.tags.map(escapeHtml).join(' · ')}</div>` : ''}
+    ${recording.matches.map(match => `<button class="search-match" data-match-id="${recording.id}" data-start="${match.start ?? ''}"><small>${escapeHtml(match.source)} ${match.start != null ? formatDuration(match.start) : ''}</small>${escapeHtml(match.text)}</button>`).join('')}
+    </article>`).join("");
   list.querySelectorAll("[data-recording-id]").forEach((button) => {
     button.addEventListener("click", () => selectRecording(button.dataset.recordingId));
   });
+  list.querySelectorAll('[data-match-id]').forEach(button => button.addEventListener('click', () => selectRecording(button.dataset.matchId, button.dataset.start === '' ? null : Number(button.dataset.start))));
 }
 
 function renderEmpty() {
@@ -94,8 +113,19 @@ function renderEmpty() {
     </div>`;
 }
 
-async function selectRecording(id) {
+async function selectRecording(id, start = null) {
+  clearTimeout(state.viewTimer);
+  clearTimeout(state.pollTimer);
+  if (id !== state.selectedId) {
+    state.detail = null;
+    $('#main-content').innerHTML = '<div class="content-width empty-state">Aufnahme wird geladen …</div>';
+  }
   state.selectedId = id;
+  state.pendingSeek = start;
+  state.viewStart = Math.max(0, (start ?? 0)-2);
+  state.visual = null;
+  state.signature = null;
+  state.visualRequest++;
   renderList();
   await refreshDetail();
 }
@@ -103,8 +133,17 @@ async function selectRecording(id) {
 async function refreshDetail() {
   if (!state.selectedId) return renderEmpty();
   try {
-    state.detail = await api(`/api/recordings/${state.selectedId}`);
-    renderDetail();
+    const id = state.selectedId;
+    const request = ++state.detailRequest;
+    const detail = await api(`/api/recordings/${id}`);
+    if (id !== state.selectedId || request !== state.detailRequest) return;
+    const signature = JSON.stringify(detail);
+    state.detail = detail;
+    if (signature !== state.signature) {
+      state.signature = signature;
+      renderDetail();
+      await loadVisual();
+    }
     schedulePolling();
   } catch (error) {
     showToast(error.message);
@@ -117,6 +156,10 @@ function getResult(id) {
 
 function renderDetail() {
   const item = state.detail;
+  const previousPlayer = $('#audio-player');
+  const keepPlayer = previousPlayer?.dataset.recordingId === item.id;
+  const wasPlaying = keepPlayer && !previousPlayer.paused;
+  const tagDraft = keepPlayer ? $('#recording-tags')?.value : null;
   const profile = getResult("audio_profile") || {};
   const vadId = getResult("vad_silero") ? "vad_silero" : "vad_energy";
   const vad = getResult(vadId) || {};
@@ -143,16 +186,19 @@ function renderDetail() {
       ${item.error ? `<div class="error-panel">${escapeHtml(item.error)}</div>` : ""}
       ${activeJobs.length && item.status !== "ready" && item.status !== "partial" ? `<div class="queue-panel"><span class="queue-spinner"></span><span><strong>${readyCount}/${totalJobs} Analyzer fertig</strong><br />Die nächsten Jobs laufen lokal in der Reihenfolge der Queue.</span></div>` : ""}
       <section class="player-panel">
-        <div><div class="player-caption">Normalisierte Arbeitskopie</div><audio id="audio-player" controls preload="metadata" src="${item.audio_url}"></audio></div>
+        <div><div class="player-caption">Mono-Arbeitskopie</div><audio id="audio-player" data-recording-id="${item.id}" controls preload="metadata" src="${item.audio_url}"></audio></div>
         <div class="player-note"><strong>Original geschützt</strong>${formatDuration(profile.duration_seconds ?? item.duration)} · ${formatBytes(item.size_bytes)} Import</div>
       </section>
+      <form id="tag-editor" class="tag-editor"><label>Tags (durch Komma getrennt)<input id="recording-tags" value="${escapeHtml((item.tags || []).join(', '))}" placeholder="Garten, Interview, Projekt …" /></label><button class="small-button">Speichern</button></form>
 
       <div class="section-title"><h2>Audio-Timeline</h2><span>${eventCount} Sprachbereiche erkannt</span></div>
       <section class="timeline-panel">
+        <div class="timeline-navigation"><label>Zeitfenster <select id="view-seconds"><option value="0">Gesamte Aufnahme</option><option value="5">5 Sekunden</option><option value="15">15 Sekunden</option><option value="30">30 Sekunden</option><option value="60">60 Sekunden</option></select></label><button class="small-button" id="view-prev">←</button><button class="small-button" id="view-player">Zur Abspielposition</button><button class="small-button" id="view-next">→</button><span id="view-range"></span></div>
+        <input id="view-position" type="range" min="0" max="${Math.max(0, (item.duration || 0)-state.viewSeconds)}" step="0.1" value="${state.viewStart}" aria-label="Zeitfenster verschieben" />
         <div class="timeline-toolbar"><span>Amplitude / Zeit</span><div class="timeline-legend"><span class="legend-item"><i class="legend-swatch speech"></i>Sprache</span><span class="legend-item"><i class="legend-swatch playhead"></i>Position</span></div></div>
-        <div class="waveform-wrap"><canvas id="waveform-canvas"></canvas><div class="timeline-labels"><span>0:00</span><span>${formatDuration(item.duration)}</span></div></div>
+        <div class="waveform-wrap"><canvas id="waveform-canvas"></canvas><div class="timeline-labels"><span id="view-label-start">0:00</span><span id="view-label-end">${formatDuration(item.duration)}</span></div></div>
         <div class="spectrogram-wrap"><canvas id="spectrogram-canvas"></canvas><span class="spectrogram-label">Frequenz / Spektrogramm</span></div>
-        <div class="timeline-help">Klicke in die Waveform oder auf ein Ereignis, um direkt an diese Stelle zu springen.</div>
+        <div class="timeline-help" id="view-help">Zeitfenster werden nachgeladen. Klicke auf Waveform oder Ereignis zum Springen.</div>
       </section>
 
       <div class="section-title"><h2>Analyse-Layer</h2><span>${readyCount} von ${totalJobs} aktiv</span></div>
@@ -175,6 +221,17 @@ function renderDetail() {
       ${renderSpeakerSection()}
       ${renderSoundEventsSection()}
     </div>`;
+  if (keepPlayer) $('#audio-player').replaceWith(previousPlayer);
+  if (wasPlaying) previousPlayer.play().catch(() => {});
+  if (tagDraft != null) $('#recording-tags').value = tagDraft;
+  $('#view-seconds').value = String(state.viewSeconds);
+  if (state.pendingSeek != null) {
+    const player = $('#audio-player');
+    const seek = state.pendingSeek;
+    const apply = () => { player.currentTime = seek; };
+    if (player.readyState) apply(); else player.addEventListener('loadedmetadata', apply, {once: true});
+    state.pendingSeek = null;
+  }
   bindDetailEvents();
   drawVisuals();
 }
@@ -377,7 +434,6 @@ function renderAnalysisCards(item, profile, vad, waveform, vadId = "vad_energy")
     configuredOrPlanned("yamnet", "✣", "Sound Events / YAMNet", "AudioSet-Klassen auf Zeitfenstern", "Sound Events", "Geräusche, Musik, Tiere und Umgebung", "YAMNet / PANNs"),
     configuredOrPlanned("birdnet", "♧", "Vogelstimmen / BirdNET", "BirdNET v2.4 Artenerkennung", "Vogelstimmen", "Arten und Zeitbereiche im Audio", "BirdNET lokal"),
     planned("⌂", "Ort / Szene", "Akustische Umgebung wie Wald oder U-Bahn", "DCASE ASC"),
-    planned("◈", "Spatial Audio", "DOA, Beamforming und Separation", "ODAS / Array"),
   ].join("");
 }
 
@@ -465,21 +521,50 @@ function renderModalContent(analyzerId, result) {
 }
 
 function bindDetailEvents() {
+  $('#tag-editor').addEventListener('submit', async event => {
+    event.preventDefault();
+    const id = state.detail.id;
+    try {
+      const result = await api(`/api/recordings/${id}/tags`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tags: $('#recording-tags').value.split(',').map(t => t.trim()).filter(Boolean)})});
+      if (state.detail?.id === id) {
+        state.detail.tags = result.tags;
+        $('#recording-tags').value = result.tags.join(', ');
+      }
+      showToast('Tags gespeichert');
+      await refreshList();
+      await loadTags();
+    } catch (error) { showToast(error.message); }
+  });
+  $('#view-seconds').addEventListener('change', event => { state.viewSeconds = Number(event.target.value); loadVisual(); });
+  $('#view-position').addEventListener('input', event => {
+    state.viewStart = Number(event.target.value);
+    clearTimeout(state.viewTimer);
+    state.viewTimer = setTimeout(loadVisual, 150);
+  });
+  $('#view-prev').onclick = () => { state.viewStart -= state.viewSeconds; loadVisual(); };
+  $('#view-next').onclick = () => { state.viewStart += state.viewSeconds; loadVisual(); };
+  $('#view-player').onclick = () => { state.viewStart = $('#audio-player').currentTime; if (!state.viewSeconds) state.viewSeconds = 30; loadVisual(); };
   $("#reload-detail")?.addEventListener("click", refreshDetail);
   $("#copy-id")?.addEventListener("click", async () => {
     try { await navigator.clipboard.writeText(state.detail.id); showToast("Aufnahme-ID kopiert"); } catch { showToast(state.detail.id); }
   });
-  $("#audio-player")?.addEventListener("timeupdate", drawVisuals);
+  if ($('#audio-player')) $('#audio-player').ontimeupdate = drawVisuals;
   $("#waveform-canvas")?.addEventListener("click", (event) => {
     const canvas = event.currentTarget;
     const bounds = canvas.getBoundingClientRect();
-    const duration = Number(state.detail.duration || 0);
+    const duration = Number(state.visual?.end_seconds ?? state.detail.duration ?? 0) - Number(state.visual?.start_seconds ?? 0);
     const player = $("#audio-player");
-    if (player && duration) player.currentTime = Math.max(0, Math.min(duration, ((event.clientX - bounds.left) / bounds.width) * duration));
+    if (player && duration) player.currentTime = Number(state.visual?.start_seconds || 0) + Math.max(0, Math.min(duration, ((event.clientX - bounds.left) / bounds.width) * duration));
   });
   document.querySelectorAll(".event-row[data-start], .transcript-segment[data-start], .chat-message[data-start]").forEach((row) => row.addEventListener("click", () => {
     const player = $("#audio-player");
-    if (player) { player.currentTime = Number(row.dataset.start); player.play().catch(() => {}); }
+    if (player) {
+      player.currentTime = Number(row.dataset.start);
+      state.viewStart = Math.max(0, player.currentTime-2);
+      if (!state.viewSeconds) state.viewSeconds = 30;
+      loadVisual();
+      player.play().catch(() => {});
+    }
   }));
   document.querySelectorAll(".rerun-button[data-analyzer-id]").forEach((btn) => btn.addEventListener("click", async (event) => {
     event.stopPropagation();
@@ -503,6 +588,34 @@ function bindDetailEvents() {
   }));
 }
 
+async function loadVisual() {
+  if (!state.detail || !$('#view-seconds')) return;
+  const id = state.selectedId;
+  const request = ++state.visualRequest;
+  const duration = Number(state.detail.duration || 0);
+  state.viewStart = Math.max(0, Math.min(state.viewStart, Math.max(0, duration-state.viewSeconds)));
+  if (!state.viewSeconds) state.viewStart = 0;
+  $('#view-seconds').value = String(state.viewSeconds);
+  const slider = $('#view-position');
+  slider.max = Math.max(0, duration-state.viewSeconds);
+  slider.value = state.viewStart;
+  slider.disabled = !state.viewSeconds || duration <= state.viewSeconds;
+  try {
+    const visual = state.viewSeconds && duration ? await api(`/api/recordings/${id}/visualization?start=${state.viewStart}&end=${Math.min(duration, state.viewStart+state.viewSeconds)}`) : getResult('waveform');
+    if (id !== state.selectedId || request !== state.visualRequest) return;
+    state.visual = visual || null;
+    const start = visual?.start_seconds || 0;
+    const end = visual?.end_seconds ?? duration;
+    $('#view-range').textContent = `${formatDuration(start)} – ${formatDuration(end)}`;
+    $('#view-label-start').textContent = formatDuration(start);
+    $('#view-label-end').textContent = formatDuration(end);
+    $('#view-help').textContent = visual?.visualization_version !== 2 ? 'Alte Übersicht: Waveform-Analyzer erneut ausführen. Zeitfenster funktionieren bereits.' :
+      (visual?.spectrogram?.sampled ? 'Spektrum: zeitliche Stichproben; für Details auf 5–15 Sekunden zoomen. Waveform enthält alle Peaks.' : 'Zeitfenster verschieben oder auf ein Ereignis klicken.');
+    state.specCache = null;
+    drawVisuals();
+  } catch (error) { if (id === state.selectedId) showToast(error.message); }
+}
+
 function setupCanvas(canvas) {
   const bounds = canvas.getBoundingClientRect();
   const ratio = window.devicePixelRatio || 1;
@@ -517,17 +630,19 @@ function drawVisuals() {
   const waveformCanvas = $("#waveform-canvas");
   const spectrogramCanvas = $("#spectrogram-canvas");
   if (!waveformCanvas || !spectrogramCanvas || !state.detail) return;
-  const waveform = getResult("waveform") || {};
+  const waveform = state.visual || {};
   const vad = getResult("vad_silero") || getResult("vad_energy") || {};
   const { ctx, width, height } = setupCanvas(waveformCanvas);
   ctx.clearRect(0, 0, width, height);
   ctx.strokeStyle = "rgba(213,227,234,0.07)";
   ctx.lineWidth = 1;
   for (let y = 0.5; y < height; y += height / 4) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(width, y); ctx.stroke(); }
-  const duration = Number(state.detail.duration || 1);
+  const viewStart = Number(waveform.start_seconds || 0);
+  const duration = Math.max(0.001, Number(waveform.end_seconds ?? state.detail.duration ?? 1) - viewStart);
   (vad.events || []).forEach((event) => {
-    const x = (event.start / duration) * width;
-    const w = ((event.end - event.start) / duration) * width;
+    if (event.end <= viewStart || event.start >= viewStart+duration) return;
+    const x = ((Math.max(viewStart, event.start)-viewStart) / duration) * width;
+    const w = ((Math.min(viewStart+duration, event.end) - Math.max(viewStart,event.start)) / duration) * width;
     ctx.fillStyle = "rgba(184,248,106,0.12)";
     ctx.fillRect(x, 0, Math.max(w, 2), height);
   });
@@ -547,11 +662,15 @@ function drawVisuals() {
   }
   const player = $("#audio-player");
   if (player && Number.isFinite(player.currentTime)) {
-    const x = (player.currentTime / duration) * width;
+    const x = ((player.currentTime-viewStart) / duration) * width;
     ctx.strokeStyle = "#f2bd70"; ctx.lineWidth = 2; ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, height); ctx.stroke();
   }
 
   const spec = waveform.spectrogram;
+  const specBounds = spectrogramCanvas.getBoundingClientRect();
+  const cacheKey = `${specBounds.width}:${specBounds.height}:${window.devicePixelRatio}`;
+  if (state.specCache?.canvas === spectrogramCanvas && state.specCache?.spec === spec && state.specCache?.key === cacheKey) return;
+  state.specCache = {canvas: spectrogramCanvas, spec, key: cacheKey};
   const { ctx: specCtx, width: specWidth, height: specHeight } = setupCanvas(spectrogramCanvas);
   specCtx.clearRect(0, 0, specWidth, specHeight);
   if (!spec?.values?.length) { specCtx.fillStyle = "rgba(143,160,169,0.3)"; specCtx.font = "11px sans-serif"; specCtx.fillText("Spektrogramm wird mit NumPy erzeugt", 3, 18); return; }
@@ -576,33 +695,54 @@ function schedulePolling() {
   if (pending) state.pollTimer = window.setTimeout(refreshDetail, 1200);
 }
 
-async function uploadFile(file) {
-  if (!file) return;
-  const form = new FormData();
-  form.append("file", file, file.name);
-  showToast(`${file.name} wird importiert …`);
-  try {
-    const item = await api("/api/import", { method: "POST", body: form });
-    state.selectedId = item.id;
-    await refreshList();
-    showToast("Import gestartet. Die Analyzer arbeiten lokal.");
-  } catch (error) {
-    showToast(error.message);
+async function uploadFiles(files) {
+  if (state.importing) return showToast('Ein Import läuft bereits.');
+  state.importing = true;
+  let done = 0, failed = 0;
+  for (const file of Array.from(files)) {
+    $('#import-progress').textContent = `Import ${done+1}/${files.length}: ${file.name}`;
+    const form = new FormData();
+    form.append('file', file, file.name);
+    try {
+      await api('/api/import', {method: 'POST', body: form, headers: {'X-File-Modified': String(file.lastModified)}});
+    } catch (error) { failed++; showToast(`${file.name}: ${error.message}`); }
+    done++;
+    if (done % 20 === 0) await refreshList();
   }
+  state.importing = false;
+  $('#file-input').value = '';
+  $('#import-progress').textContent = `${done-failed} importiert, ${failed} fehlgeschlagen.`;
+  await refreshList();
+}
+
+async function loadTags() {
+  const tags = await api('/api/tags');
+  $('#known-tags').innerHTML = tags.map(t => `<option value="${escapeHtml(t.tag)}"></option>`).join('');
 }
 
 function setupUpload() {
-  const input = $("#file-input");
-  const dropzone = $("#dropzone");
-  input.addEventListener("change", () => uploadFile(input.files[0]));
-  ["dragenter", "dragover"].forEach((type) => dropzone.addEventListener(type, (event) => { event.preventDefault(); dropzone.classList.add("is-dragging"); }));
-  ["dragleave", "drop"].forEach((type) => dropzone.addEventListener(type, (event) => { event.preventDefault(); dropzone.classList.remove("is-dragging"); }));
-  dropzone.addEventListener("drop", (event) => uploadFile(event.dataTransfer.files[0]));
+  const input = $('#file-input'), dropzone = $('#dropzone');
+  input.addEventListener('change', () => uploadFiles(input.files).catch(e => { state.importing = false; showToast(e.message); }));
+  ['dragenter','dragover'].forEach(type => dropzone.addEventListener(type, event => { event.preventDefault(); dropzone.classList.add('is-dragging'); }));
+  ['dragleave','drop'].forEach(type => dropzone.addEventListener(type, event => { event.preventDefault(); dropzone.classList.remove('is-dragging'); }));
+  dropzone.addEventListener('drop', event => uploadFiles(event.dataTransfer.files).catch(e => { state.importing = false; showToast(e.message); }));
+}
+
+function setupLibrary() {
+  const form = $('#library-filters');
+  form.addEventListener('submit', e => e.preventDefault());
+  const refresh = () => { state.offset = 0; refreshList().catch(e => showToast(e.message)); };
+  form.addEventListener('input', () => { clearTimeout(state.searchTimer); state.searchTimer = setTimeout(refresh, 300); });
+  form.addEventListener('reset', () => setTimeout(refresh, 0));
+  $('#page-prev').onclick = () => { state.offset = Math.max(0, state.offset-state.limit); refreshList().catch(e => showToast(e.message)); };
+  $('#page-next').onclick = () => { state.offset += state.limit; refreshList().catch(e => showToast(e.message)); };
 }
 
 window.addEventListener("resize", () => { window.clearTimeout(state.resizeTimer); state.resizeTimer = window.setTimeout(drawVisuals, 100); });
 window.addEventListener("DOMContentLoaded", async () => {
   setupUpload();
-  $("#refresh-button").addEventListener("click", refreshList);
+  setupLibrary();
+  loadTags().catch(error => showToast(error.message));
+  $("#refresh-button").addEventListener("click", () => refreshList().catch(e => showToast(e.message)));
   try { await refreshList(); } catch (error) { showToast(error.message); renderEmpty(); }
 });

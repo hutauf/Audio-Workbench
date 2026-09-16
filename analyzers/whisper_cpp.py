@@ -28,9 +28,7 @@ MANIFEST = AnalyzerManifest(
 
 def _timestamp(value: Any) -> float | None:
     if isinstance(value, (int, float)):
-        # whisper.cpp JSON offsets are milliseconds; accepting seconds as a
-        # fallback makes the adapter tolerant of alternate exporters.
-        return float(value) / 1000.0 if float(value) > 100 else float(value)
+        return float(value)
     if not isinstance(value, str):
         return None
     text = value.strip().replace(",", ".")
@@ -47,7 +45,14 @@ def _timestamp(value: Any) -> float | None:
 def _segment_time(segment: dict[str, Any], side: str) -> float | None:
     timestamps = segment.get("timestamps") or {}
     offsets = segment.get("offsets") or {}
-    return _timestamp(timestamps.get(side)) or _timestamp(offsets.get(side))
+    timestamp = _timestamp(timestamps.get(side))
+    if timestamp is not None:
+        return timestamp
+    offset = offsets.get(side)
+    # Offsets are always milliseconds, including 0 and values below 100.
+    if isinstance(offset, (int, float)):
+        return float(offset) / 1000.0
+    return _timestamp(segment.get(side))
 
 
 def _read_transcription(path: Path) -> list[dict[str, Any]]:
@@ -106,6 +111,8 @@ class WhisperCppAnalyzer:
                 str(normalized_path),
                 "-l",
                 self.language,
+                "-t",
+                str(max(1, int(os.environ.get('AUDIO_WORKBENCH_WHISPER_THREADS', '2')))),
                 "-oj",
                 "-of",
                 str(output_prefix),

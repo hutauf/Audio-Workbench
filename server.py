@@ -14,33 +14,41 @@ import math
 import mimetypes
 import os
 import re
-import shutil
 import sqlite3
 import subprocess
 import threading
 import uuid
 import wave
-from array import array
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, parse_qs
 
-try:
-    import numpy as np
-except ImportError:  # The prototype still starts without NumPy.
-    np = None
-
+import library
+from audio_views import audio_profile, waveform_and_spectrogram, energy_levels
 
 ROOT = Path(__file__).resolve().parent
+config_path = ROOT / 'settings.local.json'
+if config_path.is_file():
+    # Machine-local setup choices take precedence over legacy launcher defaults.
+    settings = json.loads(config_path.read_text(encoding='utf-8-sig'))
+    for key in ('WHISPER_MODEL', 'WHISPER_CLI', 'WHISPER_LANGUAGE', 'WHISPER_THREADS'):
+        if key in settings:
+            value = str(settings[key])
+            if key in ('WHISPER_MODEL', 'WHISPER_CLI'):
+                value = str((ROOT / value).resolve())
+            os.environ['AUDIO_WORKBENCH_' + key] = value
 STATIC_DIR = ROOT / "static"
 DATA_DIR = Path(os.environ.get("AUDIO_WORKBENCH_DATA", ROOT / "data"))
 DB_PATH = DATA_DIR / "workbench.sqlite3"
 DB_LOCK = threading.Lock()
 EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="audio-worker")
+WORKER_WAKE = threading.Event()
+WORKER_STOP = threading.Event()
 MAX_UPLOAD_BYTES = 512 * 1024 * 1024
 
 
@@ -48,16 +56,22 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def connect_db() -> sqlite3.Connection:
+@contextmanager
+def connect_db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        with conn:
+            yield conn
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     (DATA_DIR / "recordings").mkdir(exist_ok=True)
     with DB_LOCK, connect_db() as conn:
+        conn.execute('PRAGMA journal_mode=WAL')
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS recordings (
@@ -100,6 +114,7 @@ def init_db() -> None:
             );
             """
         )
+        library.initialize(conn)
 
 
 def fetch_one(query: str, args: tuple[Any, ...] = ()) -> sqlite3.Row | None:
@@ -187,153 +202,11 @@ def run_ffmpeg(original: Path, normalized: Path) -> None:
         detail = completed.stderr.strip().splitlines()[-1:] or ["unbekannter FFmpeg-Fehler"]
         raise RuntimeError("FFmpeg konnte die Datei nicht lesen: " + detail[0])
 
-
-def load_audio(path: Path) -> tuple[Any, int, int]:
-    with wave.open(str(path), "rb") as wav:
-        sample_rate = wav.getframerate()
-        channels = wav.getnchannels()
-        sample_width = wav.getsampwidth()
-        frames = wav.readframes(wav.getnframes())
-    if sample_width != 2:
-        raise RuntimeError("Die Arbeitskopie ist nicht 16-bit PCM.")
-    if np is not None:
-        values = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
-        if channels > 1:
-            values = values.reshape(-1, channels).mean(axis=1)
-        return values, sample_rate, channels
-    values = array("h")
-    values.frombytes(frames)
-    if channels > 1:
-        values = array("h", [sum(values[i : i + channels]) // channels for i in range(0, len(values), channels)])
-    return [sample / 32768.0 for sample in values], sample_rate, channels
-
-
-def audio_profile(path: Path) -> dict[str, Any]:
-    samples, sample_rate, channels = load_audio(path)
-    count = len(samples)
-    if np is not None:
-        peak = float(np.max(np.abs(samples))) if count else 0.0
-        rms = float(np.sqrt(np.mean(samples * samples))) if count else 0.0
-        dc = float(np.mean(samples)) if count else 0.0
-    else:
-        absolute = [abs(value) for value in samples]
-        peak = max(absolute, default=0.0)
-        rms = math.sqrt(sum(value * value for value in samples) / count) if count else 0.0
-        dc = sum(samples) / count if count else 0.0
-    duration = count / sample_rate if sample_rate else 0.0
-    return {
-        "type": "audio_profile",
-        "duration_seconds": round(duration, 3),
-        "sample_rate": sample_rate,
-        "channels": channels,
-        "peak_dbfs": round(20 * math.log10(max(peak, 1e-9)), 1),
-        "rms_dbfs": round(20 * math.log10(max(rms, 1e-9)), 1),
-        "crest_factor": round(peak / max(rms, 1e-9), 2),
-        "dc_offset": round(dc, 6),
-        "analysis_note": "Grundmetriken aus der normalisierten Arbeitskopie",
-    }
-
-
-def waveform_and_spectrogram(path: Path) -> dict[str, Any]:
-    samples, sample_rate, _ = load_audio(path)
-    if len(samples) == 0:
-        return {"type": "waveform", "sample_rate": sample_rate, "waveform": [], "spectrogram": None}
-    if np is None:
-        values = samples
-        bin_count = min(900, max(120, int(len(values) / max(sample_rate, 1) * 3)))
-        waveform = []
-        for index in range(bin_count):
-            start = int(index * len(values) / bin_count)
-            end = max(start + 1, int((index + 1) * len(values) / bin_count))
-            chunk = values[start:end]
-            waveform.append({"min": round(min(chunk, default=0.0), 4), "max": round(max(chunk, default=0.0), 4)})
-        return {"type": "waveform", "sample_rate": sample_rate, "waveform": waveform, "spectrogram": None}
-
-    total = len(samples)
-    bin_count = min(1200, max(180, int(total / max(sample_rate, 1) * 4)))
-    edges = np.linspace(0, total, bin_count + 1, dtype=np.int64)
-    waveform = []
-    for start, end in zip(edges[:-1], edges[1:]):
-        chunk = samples[start:max(start + 1, end)]
-        waveform.append(
-            {
-                "min": round(float(np.min(chunk)), 4),
-                "max": round(float(np.max(chunk)), 4),
-                "rms": round(float(np.sqrt(np.mean(chunk * chunk))), 4),
-            }
-        )
-
-    # Spectrogramm parameters: nperseg = sampling_rate / 10, 80% overlap
-    nperseg = max(256, sample_rate // 10)
-    hop = max(1, int(nperseg * 0.2))  # 80% overlap = 20% hop
-    window = np.hanning(nperseg).astype(np.float32)
-
-    spectra = []
-    start = 0
-    while start + nperseg <= len(samples):
-        frame = samples[start : start + nperseg]
-        spectrum = np.abs(np.fft.rfft(frame * window))
-        spectra.append(spectrum)
-        start += hop
-        if len(spectra) >= 400:  # Limit to reasonable resolution
-            break
-
-    if not spectra:
-        # Fallback for very short audio
-        frame = np.pad(samples, (0, max(0, nperseg - len(samples))))[:nperseg]
-        spectra.append(np.abs(np.fft.rfft(frame * window)))
-
-    matrix = np.asarray(spectra, dtype=np.float32)
-    db = 20 * np.log10(matrix + 1e-6)
-    low = float(np.percentile(db, 8))
-    high = float(np.percentile(db, 99))
-    normalized = np.clip((db - low) / max(high - low, 1e-6), 0.0, 1.0)
-    frequency_bins = 96
-    frequency_edges = np.linspace(0, normalized.shape[1], frequency_bins + 1, dtype=np.int64)
-    compact = []
-    for row in normalized:
-        compact.append(
-            [round(float(np.mean(row[a:b])), 3) for a, b in zip(frequency_edges[:-1], frequency_edges[1:])]
-        )
-
-    return {
-        "type": "waveform",
-        "sample_rate": sample_rate,
-        "waveform": waveform,
-        "spectrogram": {
-            "values": compact,
-            "frequency_max": round(sample_rate / 2),
-            "frequency_bins": frequency_bins,
-            "time_bins": len(compact),
-        },
-    }
-
-
 def vad_energy(path: Path) -> dict[str, Any]:
-    samples, sample_rate, _ = load_audio(path)
-    frame_size = max(1, int(sample_rate * 0.25))
-    if np is not None:
-        count = len(samples) // frame_size
-        if count == 0:
-            rms_db = np.asarray([], dtype=np.float32)
-        else:
-            frames = samples[: count * frame_size].reshape(count, frame_size)
-            rms = np.sqrt(np.mean(frames * frames, axis=1))
-            rms_db = 20 * np.log10(rms + 1e-7)
-        noise_floor = float(np.percentile(rms_db, 20)) if len(rms_db) else -80.0
-        threshold = max(-42.0, noise_floor + 8.0)
-        active = [bool(value > threshold) for value in rms_db]
-        values = [float(value) for value in rms_db]
-    else:
-        values = []
-        active = []
-        for start in range(0, len(samples), frame_size):
-            frame = samples[start : start + frame_size]
-            rms = math.sqrt(sum(value * value for value in frame) / max(len(frame), 1))
-            values.append(20 * math.log10(rms + 1e-7))
-        noise_floor = sorted(values)[max(0, int(len(values) * 0.2) - 1)] if values else -80.0
-        threshold = max(-42.0, noise_floor + 8.0)
-        active = [value > threshold for value in values]
+    values, sample_rate, duration, frame_size = energy_levels(path)
+    noise_floor = sorted(values)[max(0, int(len(values) * 0.2) - 1)] if values else -80.0
+    threshold = max(-42.0, noise_floor + 8.0)
+    active = [value > threshold for value in values]
 
     # Join tiny gaps, then discard very short bursts.
     for index in range(1, len(active) - 1):
@@ -346,7 +219,7 @@ def vad_energy(path: Path) -> dict[str, Any]:
             start_index = index
         elif not is_active and start_index is not None:
             start = max(0.0, start_index * frame_size / sample_rate - 0.05)
-            end = min(len(samples) / sample_rate, index * frame_size / sample_rate + 0.05)
+            end = min(duration, index * frame_size / sample_rate + 0.05)
             if end - start >= 0.30:
                 mean_db = sum(values[start_index:index]) / max(index - start_index, 1)
                 confidence = min(0.98, max(0.50, 0.60 + (mean_db - threshold) / 40))
@@ -360,7 +233,6 @@ def vad_energy(path: Path) -> dict[str, Any]:
                 )
             start_index = None
     active_seconds = sum(event["end"] - event["start"] for event in events)
-    duration = len(samples) / sample_rate if sample_rate else 0.0
     return {
         "type": "vad",
         "method": "energy-baseline",
@@ -430,13 +302,6 @@ PLANNED_ANALYZERS = [
         "description": "Arten und Zeitbereiche",
         "state": "planned",
         "technology": "BirdNET lokal",
-    },
-    {
-        "id": "spatial_audio",
-        "name": "Spatial Audio",
-        "description": "DOA, Beamforming und Separation",
-        "state": "planned",
-        "technology": "ODAS, pyroomacoustics",
     },
 ]
 
@@ -556,7 +421,8 @@ def set_job(recording_id: str, analyzer_id: str, status: str, progress: int, mes
 
 def save_result(recording_id: str, analyzer_id: str, payload: dict[str, Any]) -> None:
     result_id = uuid.uuid4().hex
-    execute(
+    with DB_LOCK, connect_db() as conn:
+        conn.execute(
         """INSERT INTO results (id, recording_id, analyzer_id, result_type, payload_json, created_at)
            VALUES (?, ?, ?, ?, ?, ?)
            ON CONFLICT(recording_id, analyzer_id) DO UPDATE SET
@@ -564,7 +430,8 @@ def save_result(recording_id: str, analyzer_id: str, payload: dict[str, Any]) ->
              payload_json = excluded.payload_json,
              created_at = excluded.created_at""",
         (result_id, recording_id, analyzer_id, payload.get("type", "generic"), json.dumps(payload, ensure_ascii=False), now_iso()),
-    )
+        )
+        library.index_result(conn, recording_id, analyzer_id, payload)
 
 
 def process_recording(recording_id: str) -> None:
@@ -573,7 +440,7 @@ def process_recording(recording_id: str) -> None:
     normalized = Path(row["normalized_path"])
 
     # Normalize if not yet done
-    if not normalized.exists() or row["status"] in ("queued", "normalizing"):
+    if not normalized.exists() or row['duration'] is None:
         try:
             set_recording_status(recording_id, "normalizing")
             run_ffmpeg(original, normalized)
@@ -588,6 +455,7 @@ def process_recording(recording_id: str) -> None:
             )
         except Exception as exc:
             set_recording_status(recording_id, "failed", str(exc))
+            execute("UPDATE jobs SET status='failed',error=?,finished_at=? WHERE recording_id=? AND status IN ('queued','running')", (str(exc), now_iso(), recording_id))
             return
 
     # Process only queued jobs
@@ -611,7 +479,11 @@ def process_recording(recording_id: str) -> None:
         manifest = ANALYZERS[analyzer_id]
         set_job(recording_id, analyzer_id, "running", 5, "Analyse läuft")
         try:
-            payload = manifest["run"](normalized)
+            if analyzer_id in {'whisper_cpp', 'yamnet', 'birdnet', 'vad_silero'}:
+                from analyzers.chunked import analyze_chunks
+                payload = analyze_chunks(manifest['run'], normalized)
+            else:
+                payload = manifest["run"](normalized)
             save_result(recording_id, analyzer_id, payload)
             set_job(recording_id, analyzer_id, "done", 100, "Fertig")
         except Exception as exc:
@@ -647,24 +519,10 @@ def public_recording(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
-def ensure_analyzer_jobs(recording_id: str) -> None:
-    """Ensure all currently registered analyzers have a job entry."""
-    existing_jobs = {
-        job["analyzer_id"]
-        for job in fetch_all("SELECT analyzer_id FROM jobs WHERE recording_id = ?", (recording_id,))
-    }
-    for analyzer_id in ANALYZERS:
-        if analyzer_id not in existing_jobs:
-            execute(
-                """INSERT INTO jobs (id, recording_id, analyzer_id, status, progress, message, created_at)
-                   VALUES (?, ?, ?, 'queued', 0, 'Neu hinzugefügter Analyzer', ?)""",
-                (uuid.uuid4().hex, recording_id, analyzer_id, now_iso()),
-            )
 
 
 def detail_recording(recording_id: str) -> dict[str, Any]:
     row = recording_row(recording_id)
-    ensure_analyzer_jobs(recording_id)
     result_rows = fetch_all("SELECT * FROM results WHERE recording_id = ? ORDER BY created_at", (recording_id,))
     payloads = []
     for result in result_rows:
@@ -676,6 +534,8 @@ def detail_recording(recording_id: str) -> dict[str, Any]:
     item = public_recording(row)
     item["audio_url"] = f"/media/{recording_id}/audio"
     item["results"] = payloads
+    item["tags"] = [r['tag'] for r in fetch_all('SELECT tag FROM recording_tags WHERE recording_id=? ORDER BY tag', (recording_id,))]
+    item["file_modified_at"] = row["file_modified_at"]
     return item
 
 
@@ -685,17 +545,27 @@ def read_file_range(path: Path, handler: BaseHTTPRequestHandler) -> None:
     start, end = 0, size - 1
     status = HTTPStatus.OK
     if range_header and range_header.startswith("bytes="):
-        match = re.match(r"bytes=(\d*)-(\d*)", range_header)
-        if match:
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+        if match and (match.group(1) or match.group(2)):
             if match.group(1):
                 start = int(match.group(1))
-            if match.group(2):
-                end = int(match.group(2))
+                if match.group(2):
+                    end = int(match.group(2))
             if not match.group(1) and match.group(2):
                 start = max(0, size - int(match.group(2)))
             end = min(end, size - 1)
             if start <= end < size:
                 status = HTTPStatus.PARTIAL_CONTENT
+            else:
+                match = None
+        else:
+            match = None
+        if match is None:
+            handler.send_response(HTTPStatus.REQUESTED_RANGE_NOT_SATISFIABLE)
+            handler.send_header('Content-Range', f'bytes */{size}')
+            handler.send_header('Content-Length', '0')
+            handler.end_headers()
+            return
     length = end - start + 1
     handler.send_response(status)
     handler.send_header("Content-Type", "audio/wav")
@@ -711,7 +581,11 @@ def read_file_range(path: Path, handler: BaseHTTPRequestHandler) -> None:
             chunk = source.read(min(1024 * 1024, remaining))
             if not chunk:
                 break
-            handler.wfile.write(chunk)
+            try:
+                handler.wfile.write(chunk)
+            except ConnectionError:
+                # Browsers cancel the old range request when seeking/closing.
+                return
             remaining -= len(chunk)
 
 
@@ -750,8 +624,20 @@ class Handler(BaseHTTPRequestHandler):
                 ] + [item for item in PLANNED_ANALYZERS if item["id"] not in ANALYZERS]
                 return self.send_json(analyzers)
             if path == "/api/recordings":
-                rows = fetch_all("SELECT * FROM recordings ORDER BY created_at DESC")
-                return self.send_json([public_recording(row) for row in rows])
+                with DB_LOCK, connect_db() as conn:
+                    page = library.list_recordings(conn, parse_qs(parsed.query))
+                return self.send_json(page)
+            if path == "/api/tags":
+                return self.send_json([dict(r) for r in fetch_all('SELECT tag,count(*) AS count FROM recording_tags GROUP BY tag ORDER BY tag LIMIT 500')])
+            match = re.fullmatch(r"/api/recordings/([a-f0-9]+)/visualization", path)
+            if match:
+                row = recording_row(match.group(1))
+                query = parse_qs(parsed.query)
+                start = float(query.get('start', ['0'])[0])
+                end = float(query.get('end', [str(start+30)])[0])
+                if not math.isfinite(start) or not math.isfinite(end) or start < 0 or not 0 < end-start <= 60:
+                    raise ValueError('Zeitfenster muss zwischen 0 und 60 Sekunden lang sein.')
+                return self.send_json(waveform_and_spectrogram(Path(row['normalized_path']), start, end))
             match = re.fullmatch(r"/api/recordings/([a-f0-9]+)/?", path)
             if match:
                 return self.send_json(detail_recording(match.group(1)))
@@ -767,10 +653,14 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/static/"):
                 return self.serve_static(path.removeprefix("/static/"))
             return self.send_error_json(HTTPStatus.NOT_FOUND, "Nicht gefunden")
+        except ConnectionError:
+            return  # Client went away; a second response would also fail.
         except KeyError:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Aufnahme nicht gefunden")
         except FileNotFoundError:
             self.send_error_json(HTTPStatus.NOT_FOUND, "Datei nicht gefunden")
+        except ValueError as exc:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
         except Exception as exc:
             self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
@@ -790,42 +680,57 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = unquote(parsed.path)
 
+        match = re.fullmatch(r"/api/recordings/([a-f0-9]+)/tags", path)
+        if match:
+            try:
+                recording_row(match.group(1))
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 8192:
+                    raise ValueError('Ungültige Tag-Anfrage.')
+                body = json.loads(self.rfile.read(length))
+                with DB_LOCK, connect_db() as conn:
+                    tags = library.set_tags(conn, match.group(1), body.get('tags'))
+                return self.send_json({'tags': tags})
+            except KeyError:
+                return self.send_error_json(HTTPStatus.NOT_FOUND, 'Aufnahme nicht gefunden')
+            except (ValueError, AttributeError) as exc:
+                return self.send_error_json(HTTPStatus.BAD_REQUEST, str(exc))
+
         # Rerun endpoint
         match = re.fullmatch(r"/api/recordings/([a-f0-9]+)/rerun/?", path)
         if match:
             recording_id = match.group(1)
             try:
-                from urllib.parse import parse_qs
                 query = parse_qs(parsed.query)
                 analyzer_ids = query.get("analyzer_id", list(ANALYZERS.keys()))
                 if isinstance(analyzer_ids, str):
                     analyzer_ids = [analyzer_ids]
 
-                # Reset requested jobs to queued
-                for analyzer_id in analyzer_ids:
-                    if analyzer_id not in ANALYZERS:
-                        continue
-                    existing = fetch_one(
-                        "SELECT id FROM jobs WHERE recording_id = ? AND analyzer_id = ?",
-                        (recording_id, analyzer_id),
-                    )
-                    if existing:
-                        execute(
-                            """UPDATE jobs SET status = 'queued', progress = 0, message = 'Neu gestartet',
-                               error = NULL, started_at = NULL, finished_at = NULL
-                               WHERE recording_id = ? AND analyzer_id = ?""",
-                            (recording_id, analyzer_id),
-                        )
-                    else:
-                        execute(
-                            """INSERT INTO jobs (id, recording_id, analyzer_id, status, progress, message, created_at)
-                               VALUES (?, ?, ?, 'queued', 0, 'Wartet auf Worker', ?)""",
-                            (uuid.uuid4().hex, recording_id, analyzer_id, now_iso()),
-                        )
-
-                # Resubmit to queue
-                EXECUTOR.submit(process_recording, recording_id)
+                if any(analyzer_id not in ANALYZERS for analyzer_id in analyzer_ids):
+                    return self.send_error_json(HTTPStatus.BAD_REQUEST, 'Unbekannter Analyzer.')
+                # Publish jobs and queued state atomically, including concurrent reruns.
+                with DB_LOCK, connect_db() as conn:
+                    current = conn.execute('SELECT status FROM recordings WHERE id=?', (recording_id,)).fetchone()
+                    if current is None:
+                        raise KeyError(recording_id)
+                    busy = current['status'] in ('queued', 'normalizing', 'processing')
+                    if not busy:
+                        for analyzer_id in analyzer_ids:
+                            conn.execute(
+                                """INSERT INTO jobs (id,recording_id,analyzer_id,status,progress,message,created_at)
+                                   VALUES (?,?,?,'queued',0,'Wartet auf Worker',?)
+                                   ON CONFLICT(recording_id,analyzer_id) DO UPDATE SET
+                                   status='queued',progress=0,message='Neu gestartet',error=NULL,
+                                   started_at=NULL,finished_at=NULL""",
+                                (uuid.uuid4().hex, recording_id, analyzer_id, now_iso()),
+                            )
+                        conn.execute("UPDATE recordings SET status='queued',error=NULL WHERE id=?", (recording_id,))
+                if busy:
+                    return self.send_error_json(HTTPStatus.CONFLICT, 'Aufnahme ist bereits in der Queue.')
+                WORKER_WAKE.set()
                 return self.send_json(detail_recording(recording_id), HTTPStatus.OK)
+            except KeyError:
+                return self.send_error_json(HTTPStatus.NOT_FOUND, 'Aufnahme nicht gefunden')
             except Exception as exc:
                 return self.send_error_json(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
@@ -843,19 +748,27 @@ class Handler(BaseHTTPRequestHandler):
             original = recording_dir / f"original{Path(filename).suffix.lower() or '.bin'}"
             normalized = recording_dir / "normalized.wav"
             original.write_bytes(content)
-            execute(
-                """INSERT INTO recordings
-                   (id, original_name, original_path, normalized_path, size_bytes, created_at, status)
-                   VALUES (?, ?, ?, ?, ?, ?, 'queued')""",
-                (recording_id, filename, str(original), str(normalized), len(content), now_iso()),
-            )
-            for analyzer_id in ANALYZERS:
-                execute(
-                    """INSERT INTO jobs (id, recording_id, analyzer_id, status, progress, message, created_at)
-                       VALUES (?, ?, ?, 'queued', 0, 'Wartet auf Normalisierung', ?)""",
-                    (uuid.uuid4().hex, recording_id, analyzer_id, now_iso()),
+            timestamp = None
+            modified = self.headers.get('X-File-Modified')
+            if modified:
+                try:
+                    timestamp = datetime.fromtimestamp(float(modified)/1000, timezone.utc).isoformat()
+                except (ValueError, OverflowError, OSError):
+                    pass
+            # The worker must never see a recording before all its jobs exist.
+            with DB_LOCK, connect_db() as conn:
+                conn.execute(
+                    """INSERT INTO recordings
+                       (id,original_name,original_path,normalized_path,size_bytes,created_at,status,file_modified_at)
+                       VALUES (?,?,?,?,?,?,'queued',?)""",
+                    (recording_id, filename, str(original), str(normalized), len(content), now_iso(), timestamp),
                 )
-            EXECUTOR.submit(process_recording, recording_id)
+                conn.executemany(
+                    """INSERT INTO jobs (id,recording_id,analyzer_id,status,progress,message,created_at)
+                       VALUES (?,?,?,'queued',0,'Wartet auf Normalisierung',?)""",
+                    [(uuid.uuid4().hex, recording_id, analyzer_id, now_iso()) for analyzer_id in ANALYZERS],
+                )
+            WORKER_WAKE.set()
             return self.send_json(detail_recording(recording_id), HTTPStatus.CREATED)
         except ValueError as exc:
             return self.send_error_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, str(exc))
@@ -865,13 +778,24 @@ class Handler(BaseHTTPRequestHandler):
 
 def resume_pending_jobs() -> None:
     """Resume recordings that were interrupted during processing."""
-    interrupted = fetch_all(
-        "SELECT id FROM recordings WHERE status IN ('queued', 'normalizing', 'processing') ORDER BY created_at"
-    )
-    if interrupted:
-        print(f"Setze {len(interrupted)} unterbrochene Aufnahmen fort …")
-        for row in interrupted:
-            EXECUTOR.submit(process_recording, row["id"])
+    execute("UPDATE jobs SET status='queued' WHERE status='running'")
+    execute("UPDATE recordings SET status='queued' WHERE status IN ('normalizing','processing')")
+    WORKER_WAKE.set()
+
+
+def worker_loop() -> None:
+    # SQLite holds the backlog; only one recording is in Python at a time.
+    while not WORKER_STOP.is_set():
+        row = fetch_one("SELECT id FROM recordings WHERE status='queued' ORDER BY created_at,id LIMIT 1")
+        if row:
+            try:
+                process_recording(row['id'])
+            except Exception as exc:
+                set_recording_status(row['id'], 'failed', str(exc))
+                execute("UPDATE jobs SET status='failed',error=?,finished_at=? WHERE recording_id=? AND status IN ('queued','running')", (str(exc), now_iso(), row['id']))
+        else:
+            WORKER_WAKE.wait(1)
+            WORKER_WAKE.clear()
 
 
 def main() -> None:
@@ -886,6 +810,7 @@ def main() -> None:
     init_db()
     resume_pending_jobs()
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    EXECUTOR.submit(worker_loop)
     print(f"Audio Workbench läuft auf http://{args.host}:{args.port}")
     print(f"Datenordner: {DATA_DIR}")
     try:
@@ -893,6 +818,8 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nBeendet.")
     finally:
+        WORKER_STOP.set()
+        WORKER_WAKE.set()
         server.server_close()
         EXECUTOR.shutdown(wait=False, cancel_futures=True)
 

@@ -75,7 +75,7 @@ def analyze(
     model = Path(model_path or os.environ.get("AUDIO_WORKBENCH_SILERO_VAD_MODEL", ""))
     if not model.is_file():
         raise AnalyzerUnavailable(
-            "Silero-Modell fehlt. Setze AUDIO_WORKBENCH_SILERO_VAD_MODEL auf silero_vad.int8.onnx."
+            "Silero-Modell fehlt. Setze AUDIO_WORKBENCH_SILERO_VAD_MODEL auf silero_vad.onnx."
         )
     try:
         import numpy as np
